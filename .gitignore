@@ -1,0 +1,6 @@
+consumer/multi-5a.json
+consumer/messaging_multi5a.json
+consumer/configOAuth.json
+.env
+go.mod
+go.sum
