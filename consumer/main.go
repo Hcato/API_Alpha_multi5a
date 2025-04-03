@@ -20,8 +20,8 @@ import (
 
 // Archivo multi-5a.json consultar con cato.
 var db *sql.DB
-var rabbitMQURL = os.Getenv("RABBIT")
-var queueName = os.Getenv("QUEUENAME")
+var rabbitMQURL = "amqp://cato:5678@3.233.111.240/"
+var queueName = "messages"
 
 type RabbitMessage struct {
 	Header      string `json:"header"`

@@ -4,3 +4,4 @@ consumer/configOAuth.json
 .env
 go.mod
 go.sum
+api_users/uploads
