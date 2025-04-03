@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/gorilla/mux"
@@ -72,6 +74,23 @@ type CollaboratorWithUser struct {
 	Collaborator
 	Username string `json:"username"`
 	Image    string `json:"image"`
+}
+
+type StationWithOwner struct {
+	ID        int     `json:"id"`
+	Name      string  `json:"name"`
+	Latitude  float64 `json:"latitude"`
+	Longitude float64 `json:"longitude"`
+	OwnerID   int     `json:"owner_id"`
+	Plan      string  `json:"plan"`
+	Owner     struct {
+		ID       int    `json:"id"`
+		Username string `json:"username"`
+		Email    string `json:"email"`
+		Image    string `json:"image"`
+		Token    string `json:"token"`
+		Token2   string `json:"token2"`
+	} `json:"owner"`
 }
 
 var db *sql.DB
@@ -183,6 +202,7 @@ func createRequest(w http.ResponseWriter, r *http.Request) {
 	var req Request
 	json.NewDecoder(r.Body).Decode(&req)
 	req.StationID = parseID(params["station_id"])
+
 	tx, err := db.Begin()
 	if err != nil {
 		http.Error(w, "Database error", http.StatusInternalServerError)
@@ -190,20 +210,93 @@ func createRequest(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback()
 
-	_, err = tx.Exec("INSERT INTO requests (user_id, station_id, status) VALUES (?, ?, 'pending')", req.UserID, req.StationID)
+	// 1. Insertar la solicitud
+	result, err := tx.Exec("INSERT INTO requests (user_id, station_id, status) VALUES (?, ?, 'pending')",
+		req.UserID, req.StationID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+
+	requestID, _ := result.LastInsertId()
+
+	// 2. Obtener información del dueño y solicitante
+	var ownerInfo struct {
+		ID       int
+		Username string
+	}
+	var requesterUsername string
+
+	err = tx.QueryRow(`
+        SELECT u.id, u.username 
+        FROM stations s
+        JOIN users u ON s.owner_id = u.id
+        WHERE s.id = ?`, req.StationID).Scan(&ownerInfo.ID, &ownerInfo.Username)
+	if err != nil {
+		http.Error(w, "Error obteniendo info del dueño", http.StatusInternalServerError)
+		return
+	}
+
+	err = tx.QueryRow("SELECT username FROM users WHERE id = ?", req.UserID).Scan(&requesterUsername)
+	if err != nil {
+		requesterUsername = "Un usuario"
+	}
+
 	tx.Commit()
+
+	// 3. Enviar notificación a través de la API de mensajería
+	go sendNotificationToMessagingAPI(ownerInfo.ID, requestID, req.StationID, requesterUsername)
+
 	w.WriteHeader(http.StatusCreated)
 }
 
-func getRequestsByStation(w http.ResponseWriter, r *http.Request) {
+func sendNotificationToMessagingAPI(ownerID int, requestID int64, stationID int, requesterUsername string) {
+	// Obtener el token FCM del dueño (token2) directamente
+	var ownerToken string
+	err := db.QueryRow("SELECT token2 FROM users WHERE id = ?", ownerID).Scan(&ownerToken)
+	if err != nil || ownerToken == "" {
+		log.Printf("No se pudo obtener token FCM del dueño %d: %v", ownerID, err)
+		return
+	}
+
+	notification := map[string]interface{}{
+		"fcm_token": ownerToken, // Enviamos directamente el token FCM
+		"title":     "Nueva solicitud de colaboración",
+		"message":   fmt.Sprintf("%s quiere unirse a tu estación", requesterUsername),
+		"data": map[string]string{
+			"type":         "collaboration_request",
+			"station_id":   strconv.Itoa(stationID),
+			"request_id":   strconv.FormatInt(requestID, 10),
+			"requester":    requesterUsername,
+			"click_action": "FLUTTER_NOTIFICATION_CLICK", // Para manejar clics en Flutter
+		},
+	}
+
+	jsonData, err := json.Marshal(notification)
+	if err != nil {
+		log.Printf("Error creando JSON de notificación: %v", err)
+		return
+	}
+
+	messagingAPIURL := "http://127.0.0.1:8081/send-notification"
+	resp, err := http.Post(messagingAPIURL, "application/json", bytes.NewBuffer(jsonData))
+	if err != nil {
+		log.Printf("Error llamando a API de mensajería: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		log.Printf("API de mensajería respondió con error %d: %s", resp.StatusCode, string(body))
+	}
+}
+
+func getRequestsByStation(w http.ResponseWriter, r *http.Request) { //CAMBIADO POR EL BIEN DE LA TRAMA
 	params := mux.Vars(r)
 	stationID := parseID(params["station_id"])
 
-	rows, err := db.Query("SELECT id, user_id, station_id, status FROM requests WHERE station_id = ?", stationID)
+	rows, err := db.Query("SELECT id, user_id, station_id, status FROM requests WHERE station_id = ? AND status = 'pending'", stationID)
 	if err != nil {
 		http.Error(w, "Error fetching requests", http.StatusInternalServerError)
 		return
@@ -227,27 +320,25 @@ func getRequestsByStation(w http.ResponseWriter, r *http.Request) {
 
 		if err != nil {
 			log.Println("Error al obtener usuario:", err) // Loguea el error exacto
-			// Puedes decidir si sigues sin el usuario o devuelves un error
-			user = User{}
+			user = User{}                                 // Si falla, asigna un usuario vacío
 		}
 
 		// Manejo de NULL para strings
-		user.Image = image.String
-		if !image.Valid {
-			user.Image = ""
+		user.Image = ""
+		if image.Valid {
+			user.Image = image.String
 		}
-		user.Token = token.String
-		if !token.Valid {
-			user.Token = ""
+		user.Token = ""
+		if token.Valid {
+			user.Token = token.String
 		}
-		user.Token2 = token2.String
-		if !token2.Valid {
-			user.Token2 = ""
+		user.Token2 = ""
+		if token2.Valid {
+			user.Token2 = token2.String
 		}
 
 		// Asignar usuario a la respuesta
 		req.User = user
-
 		requests = append(requests, req)
 	}
 
@@ -268,6 +359,26 @@ func updateRequestStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback()
 
+	// Primero obtenemos los datos necesarios para la notificación
+	var requestInfo struct {
+		UserID      int
+		StationID   int
+		StationName string
+	}
+
+	err = tx.QueryRow(`
+        SELECT r.user_id, r.station_id, s.name 
+        FROM requests r
+        JOIN stations s ON r.station_id = s.id
+        WHERE r.id = ?`, req.ID).Scan(
+		&requestInfo.UserID,
+		&requestInfo.StationID,
+		&requestInfo.StationName)
+	if err != nil {
+		http.Error(w, "Error obteniendo información de la solicitud", http.StatusInternalServerError)
+		return
+	}
+
 	if req.Status == "accepted" {
 		_, err = tx.Exec("INSERT INTO collaborators (user_id, station_id) SELECT user_id, station_id FROM requests WHERE id = ?", req.ID)
 		if err != nil {
@@ -281,8 +392,65 @@ func updateRequestStatus(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+
 	tx.Commit()
+
+	// Enviamos la notificación al usuario solicitante
+	go sendRequestStatusNotification(requestInfo.UserID, req.ID, requestInfo.StationID, requestInfo.StationName, req.Status)
+
 	w.WriteHeader(http.StatusOK)
+}
+
+func sendRequestStatusNotification(userID int, requestID int, stationID int, stationName string, status string) {
+	// Obtener el token FCM del solicitante (token2) directamente
+	var userToken string
+	err := db.QueryRow("SELECT token2 FROM users WHERE id = ?", userID).Scan(&userToken)
+	if err != nil || userToken == "" {
+		log.Printf("No se pudo obtener token FCM del usuario %d: %v", userID, err)
+		return
+	}
+
+	// Crear mensaje según el estado
+	var title, message string
+	if status == "accepted" {
+		title = "Solicitud aceptada"
+		message = fmt.Sprintf("Tu solicitud para la estación %s ha sido aceptada", stationName)
+	} else {
+		title = "Solicitud rechazada"
+		message = fmt.Sprintf("Tu solicitud para la estación %s ha sido rechazada", stationName)
+	}
+
+	notification := map[string]interface{}{
+		"fcm_token": userToken,
+		"title":     title,
+		"message":   message,
+		"data": map[string]string{
+			"type":         "request_status_update",
+			"station_id":   strconv.Itoa(stationID),
+			"request_id":   strconv.Itoa(requestID),
+			"status":       status,
+			"click_action": "FLUTTER_NOTIFICATION_CLICK",
+		},
+	}
+
+	jsonData, err := json.Marshal(notification)
+	if err != nil {
+		log.Printf("Error creando JSON de notificación: %v", err)
+		return
+	}
+
+	messagingAPIURL := "http://127.0.0.1:8081/send-notification"
+	resp, err := http.Post(messagingAPIURL, "application/json", bytes.NewBuffer(jsonData))
+	if err != nil {
+		log.Printf("Error llamando a API de mensajería: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		log.Printf("API de mensajería respondió con error %d: %s", resp.StatusCode, string(body))
+	}
 }
 
 func parseID(idStr string) int {
@@ -444,13 +612,47 @@ func createStation(w http.ResponseWriter, r *http.Request) {
 
 func getStation(w http.ResponseWriter, r *http.Request) {
 	params := mux.Vars(r)
-	var station Station
-	err := db.QueryRow("SELECT id, name, latitude, longitude, owner_id, plan FROM stations WHERE id = ?", params["id"]).Scan(
+	var station StationWithOwner
+	err := db.QueryRow(`
+        SELECT s.id, s.name, s.latitude, s.longitude, s.owner_id, s.plan 
+        FROM stations s 
+        WHERE s.id = ?`, params["id"]).Scan(
 		&station.ID, &station.Name, &station.Latitude, &station.Longitude, &station.OwnerID, &station.Plan)
+
 	if err != nil {
 		http.Error(w, "Station not found", http.StatusNotFound)
 		return
 	}
+
+	// Ahora obtenemos la información del dueño
+	var image, token, token2 sql.NullString
+	err = db.QueryRow(`
+        SELECT u.id, u.username, u.email, u.image, u.token, u.token2 
+        FROM users u 
+        WHERE u.id = ?`, station.OwnerID).Scan(
+		&station.Owner.ID, &station.Owner.Username, &station.Owner.Email,
+		&image, &token, &token2)
+
+	if err != nil {
+		http.Error(w, "Owner information not available", http.StatusInternalServerError)
+		return
+	}
+
+	// Manejo de campos NULL como en tu implementación
+	station.Owner.Image = image.String
+	if !image.Valid {
+		station.Owner.Image = ""
+	}
+	station.Owner.Token = token.String
+	if !token.Valid {
+		station.Owner.Token = ""
+	}
+	station.Owner.Token2 = token2.String
+	if !token2.Valid {
+		station.Owner.Token2 = ""
+	}
+
+	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(station)
 }
 

@@ -348,12 +348,49 @@ func sendFCMNotification(token, header, description, image string) error {
 	return nil
 }
 
+// Handler para enviar notificaciones personalizadas
+func sendNotificationHandler(w http.ResponseWriter, r *http.Request) {
+	var request struct {
+		FCMToken string            `json:"fcm_token"`
+		Title    string            `json:"title"`
+		Message  string            `json:"message"`
+		Data     map[string]string `json:"data,omitempty"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		http.Error(w, `{"error": "Formato de notificación inválido"}`, http.StatusBadRequest)
+		return
+	}
+
+	if request.FCMToken == "" {
+		http.Error(w, `{"error": "Token FCM requerido"}`, http.StatusBadRequest)
+		return
+	}
+
+	// Usamos la imagen de los datos si está presente
+	image := ""
+	if request.Data != nil {
+		image = request.Data["image"]
+	}
+
+	err := sendFCMNotification(request.FCMToken, request.Title, request.Message, image)
+	if err != nil {
+		http.Error(w, `{"error": "Error enviando notificación"}`, http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
 func main() {
 	initDB()
 	go consumeRabbitMQ()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/suscribe-topic", subscribeHandler)
+	mux.HandleFunc("/send-notification", sendNotificationHandler)
 
 	// Usar middleware CORS
 	handler := corsMiddleware(mux)
